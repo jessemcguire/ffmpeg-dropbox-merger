@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: ffmpeg-merge-service
+    env: node
+    plan: free
+    region: oregon
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: DROPBOX_ACCESS_TOKEN
+        sync: false
