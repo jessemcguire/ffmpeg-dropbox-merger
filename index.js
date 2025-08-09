@@ -18,113 +18,65 @@ const DROPBOX_TOKEN = process.env.DROPBOX_ACCESS_TOKEN;
 app.use(express.json({ limit: '2mb' }));
 
 // --- Helpers ---
-function normalizeDropboxUrl(url) {
-  try {
-    const u = new URL(url);
-    if (u.hostname === 'www.dropbox.com' || u.hostname === 'dropbox.com') {
-      u.hostname = 'dl.dropboxusercontent.com';
-      u.search = '';
-    }
-    return u.toString();
-  } catch {
-    return url;
-  }
-}
-
-function isAllowedDropboxUrl(url) {
-  try {
-    const u = new URL(url);
-    return ['dl.dropboxusercontent.com', 'www.dropbox.com', 'dropbox.com'].includes(u.hostname);
-  } catch {
-    return false;
-  }
+function log(step, extra = {}) {
+  console.log(JSON.stringify({ ts: new Date().toISOString(), step, ...extra }));
 }
 
 async function downloadToTemp(url, extFallback = '.bin') {
   const id = randomUUID();
-  const ext = path.extname(new URL(url).pathname) || extFallback;
+  const ext = (() => { try { return path.extname(new URL(url).pathname) || extFallback; } catch { return extFallback; }})();
   const filePath = path.join('/tmp', `${id}${ext}`);
-  const resp = await axios.get(url, { responseType: 'stream', maxRedirects: 5 });
+  log('download.http.start', { url });
+  const resp = await axios.get(url, { responseType: 'stream', maxRedirects: 5, validateStatus: s => s < 400 });
   await pipeline(resp.data, fs.createWriteStream(filePath));
+  log('download.http.ok', { filePath });
   return filePath;
 }
 
-function mergeAV({ videoPath, audioPath, outPath }) {
+async function downloadSharedLinkToTemp(sharedLink, extFallback = '.bin') {
+  if (!DROPBOX_TOKEN) throw new Error('DROPBOX_ACCESS_TOKEN is not set');
+  const ext = (() => { try { return path.extname(new URL(sharedLink).pathname) || extFallback; } catch { return extFallback; }})();
+  const out = path.join('/tmp', `${randomUUID()}${ext}`);
+
+  log('download.dropbox.start', { url: sharedLink });
+  const resp = await axios.post(
+    'https://content.dropboxapi.com/2/sharing/get_shared_link_file',
+    null,
+    {
+      responseType: 'stream',
+      headers: {
+        Authorization: `Bearer ${DROPBOX_TOKEN}`,
+        'Dropbox-API-Arg': JSON.stringify({ url: sharedLink.replace('?dl=0', '?dl=1') })
+      },
+      // Dropbox returns non-2xx for some cases; let it throw so we see it
+      validateStatus: s => s < 400
+    }
+  );
+  await pipeline(resp.data, fs.createWriteStream(out));
+  log('download.dropbox.ok', { filePath: out });
+  return out;
+}
+
+function isDropboxLink(url) {
+  return /(^https?:\/\/)?(www\.)?dropbox\.com|dl\.dropboxusercontent\.com/i.test(url || '');
+}
+
+function mergeAV({ videoPath, audioPath, outPath, forceReencode = false }) {
   return new Promise((resolve, reject) => {
-    ffmpeg()
-      .input(videoPath)
-      .input(audioPath)
-      .outputOptions(['-c:v copy', '-c:a aac', '-shortest'])
-      .on('error', reject)
-      .on('end', () => resolve(outPath))
+    const cmd = ffmpeg().input(videoPath).input(audioPath);
+    const opts = forceReencode
+      ? ['-c:v libx264', '-c:a aac', '-movflags +faststart', '-shortest']
+      : ['-c:v copy', '-c:a aac', '-shortest'];
+
+    log('ffmpeg.start', { videoPath, audioPath, outPath, forceReencode });
+    cmd.outputOptions(opts)
+      .on('error', (err) => { log('ffmpeg.error', { err: String(err) }); reject(err); })
+      .on('end', () => { log('ffmpeg.ok', { outPath }); resolve(outPath); })
       .save(outPath);
   });
 }
 
-async function safeUnlink(p) {
-  try { await fs.promises.unlink(p); } catch {}
-}
-
-// --- Dropbox helpers ---
-async function dropboxUpload(filePath, dropboxPath) {
-  if (!DROPBOX_TOKEN) throw new Error('DROPBOX_ACCESS_TOKEN is not set');
-  const content = await fs.promises.readFile(filePath);
-  const targetPath = dropboxPath || `/merged-${Date.now()}.mp4`;
-
-  await axios.post(
-    'https://content.dropboxapi.com/2/files/upload',
-    content,
-    {
-      headers: {
-        'Authorization': `Bearer ${DROPBOX_TOKEN}`,
-        'Content-Type': 'application/octet-stream',
-        'Dropbox-API-Arg': JSON.stringify({
-          path: targetPath,
-          mode: 'overwrite',
-          autorename: false,
-          mute: false,
-          strict_conflict: false
-        })
-      },
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity
-    }
-  );
-
-  return targetPath;
-}
-
-async function dropboxGetTemporaryLink(pathLower) {
-  if (!DROPBOX_TOKEN) throw new Error('DROPBOX_ACCESS_TOKEN is not set');
-  const { data } = await axios.post(
-    'https://api.dropboxapi.com/2/files/get_temporary_link',
-    { path: pathLower },
-    { headers: { Authorization: `Bearer ${DROPBOX_TOKEN}`, 'Content-Type': 'application/json' } }
-  );
-  return data.link;
-}
-
-async function dropboxCreateSharedLink(pathLower) {
-  if (!DROPBOX_TOKEN) throw new Error('DROPBOX_ACCESS_TOKEN is not set');
-  try {
-    const { data } = await axios.post(
-      'https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings',
-      { path: pathLower, settings: { requested_visibility: 'public' } },
-      { headers: { Authorization: `Bearer ${DROPBOX_TOKEN}`, 'Content-Type': 'application/json' } }
-    );
-    return data.url;
-  } catch (err) {
-    if (err.response && err.response.data && err.response.data.error_summary && err.response.data.error_summary.includes('shared_link_already_exists')) {
-      const { data } = await axios.post(
-        'https://api.dropboxapi.com/2/sharing/list_shared_links',
-        { path: pathLower, direct_only: true },
-        { headers: { Authorization: `Bearer ${DROPBOX_TOKEN}`, 'Content-Type': 'application/json' } }
-      );
-      if (data.links && data.links.length) return data.links[0].url;
-    }
-    throw err;
-  }
-}
+async function safeUnlink(p) { try { await fs.promises.unlink(p); } catch {} }
 
 // --- Route ---
 app.post('/merge', async (req, res) => {
@@ -134,67 +86,108 @@ app.post('/merge', async (req, res) => {
     filename = 'merged.mp4',
     uploadToDropbox = false,
     dropboxPath,
-    shareType = 'temporary'
+    shareType = 'temporary', // 'temporary' | 'shared'
+    forceReencode = false
   } = req.body || {};
+
+  log('request', { videoUrl, audioUrl, uploadToDropbox, shareType, forceReencode });
 
   if (!videoUrl || !audioUrl) {
     return res.status(400).json({ error: 'Missing videoUrl or audioUrl' });
   }
-
-  const vUrl = normalizeDropboxUrl(videoUrl);
-  const aUrl = normalizeDropboxUrl(audioUrl);
-
-  if (!isAllowedDropboxUrl(vUrl) || !isAllowedDropboxUrl(aUrl)) {
-    return res.status(400).json({ error: 'Only Dropbox URLs are allowed.' });
-  }
-
   if (uploadToDropbox && !DROPBOX_TOKEN) {
     return res.status(400).json({ error: 'uploadToDropbox requested but DROPBOX_ACCESS_TOKEN is not set.' });
   }
 
   let videoPath, audioPath, outPath;
   try {
-    videoPath = await downloadToTemp(vUrl, '.mp4');
-    audioPath = await downloadToTemp(aUrl, '.m4a');
+    // Prefer Dropbox API for Dropbox links (avoids 403s)
+    videoPath = isDropboxLink(videoUrl)
+      ? await downloadSharedLinkToTemp(videoUrl, '.mp4')
+      : await downloadToTemp(videoUrl, '.mp4');
+
+    audioPath = isDropboxLink(audioUrl)
+      ? await downloadSharedLinkToTemp(audioUrl, '.m4a')
+      : await downloadToTemp(audioUrl, '.m4a');
+
     outPath = path.join('/tmp', `${randomUUID()}.mp4`);
 
-    await mergeAV({ videoPath, audioPath, outPath });
+    await mergeAV({ videoPath, audioPath, outPath, forceReencode });
 
     if (uploadToDropbox) {
-      const remotePath = await dropboxUpload(outPath, dropboxPath);
-      const link = shareType === 'shared'
-        ? await dropboxCreateSharedLink(remotePath)
-        : await dropboxGetTemporaryLink(remotePath);
+      if (!DROPBOX_TOKEN) throw new Error('DROPBOX_ACCESS_TOKEN is not set');
+      log('dropbox.upload.start', { dropboxPath });
+      const content = await fs.promises.readFile(outPath);
+      const targetPath = dropboxPath || `/merged-${Date.now()}.mp4`;
 
-      await safeUnlink(videoPath);
-      await safeUnlink(audioPath);
-      await safeUnlink(outPath);
+      await axios.post(
+        'https://content.dropboxapi.com/2/files/upload',
+        content,
+        {
+          headers: {
+            Authorization: `Bearer ${DROPBOX_TOKEN}`,
+            'Content-Type': 'application/octet-stream',
+            'Dropbox-API-Arg': JSON.stringify({
+              path: targetPath, mode: 'overwrite', autorename: false, mute: false, strict_conflict: false
+            })
+          },
+          maxBodyLength: Infinity, maxContentLength: Infinity, validateStatus: s => s < 400
+        }
+      );
+      log('dropbox.upload.ok', { targetPath });
 
-      return res.json({
-        status: 'uploaded',
-        path: remotePath,
-        url: link,
-        linkType: shareType
-      });
+      let url;
+      if (shareType === 'shared') {
+        try {
+          const { data } = await axios.post(
+            'https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings',
+            { path: targetPath, settings: { requested_visibility: 'public' } },
+            { headers: { Authorization: `Bearer ${DROPBOX_TOKEN}`, 'Content-Type': 'application/json' }, validateStatus: s => s < 500 }
+          );
+          url = data.url;
+        } catch (err) {
+          if (err.response?.data?.error_summary?.includes('shared_link_already_exists')) {
+            const { data } = await axios.post(
+              'https://api.dropboxapi.com/2/sharing/list_shared_links',
+              { path: targetPath, direct_only: true },
+              { headers: { Authorization: `Bearer ${DROPBOX_TOKEN}`, 'Content-Type': 'application/json' } }
+            );
+            url = data.links?.[0]?.url;
+          } else {
+            throw err;
+          }
+        }
+      } else {
+        const { data } = await axios.post(
+          'https://api.dropboxapi.com/2/files/get_temporary_link',
+          { path: targetPath },
+          { headers: { Authorization: `Bearer ${DROPBOX_TOKEN}`, 'Content-Type': 'application/json' } }
+        );
+        url = data.link;
+      }
+
+      await safeUnlink(videoPath); await safeUnlink(audioPath); await safeUnlink(outPath);
+      log('done.uploaded', { urlType: shareType });
+
+      return res.json({ status: 'uploaded', path: targetPath, url, linkType: shareType });
     }
 
+    // Stream back
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Disposition', `attachment; filename="${path.basename(filename)}"`);
     const read = fs.createReadStream(outPath);
     read.on('close', async () => {
-      await safeUnlink(videoPath);
-      await safeUnlink(audioPath);
-      await safeUnlink(outPath);
+      await safeUnlink(videoPath); await safeUnlink(audioPath); await safeUnlink(outPath);
+      log('done.streamed');
     });
     read.pipe(res);
   } catch (err) {
-    await safeUnlink(videoPath);
-    await safeUnlink(audioPath);
-    await safeUnlink(outPath);
-    console.error(err);
-    res.status(500).json({ error: 'Merge failed', details: String(err.message || err) });
+    await safeUnlink(videoPath); await safeUnlink(audioPath); await safeUnlink(outPath);
+    log('error', { err: String(err) });
+    res.status(500).json({ error: 'Merge failed', details: String(err?.message || err) });
   }
 });
 
+app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get('/', (_req, res) => res.send('OK'));
 app.listen(port, () => console.log(`Server running on ${port}`));
