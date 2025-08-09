@@ -133,6 +133,7 @@ audioPath = isDropboxLink(audioUrl)
   ? await downloadDropboxSmart(audioUrl, '.m4a')
   : await downloadToTemp(audioUrl, '.m4a');
 
+
     outPath = path.join('/tmp', `${randomUUID()}.mp4`);
 
     await mergeAV({ videoPath, audioPath, outPath, forceReencode });
@@ -215,18 +216,7 @@ app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get('/', (_req, res) => res.send('OK'));
 app.listen(port, () => console.log(`Server running on ${port}`));
 
-function sanitizeDropboxUrl(u) {
-  try {
-    const url = new URL(u);
-    if (/dropbox\.com/i.test(url.hostname)) {
-      url.searchParams.delete('st');         // ← drop session-ish param
-      url.searchParams.set('dl', '1');       // ← force direct download
-    }
-    return url.toString();
-  } catch {
-    return u;
-  }
-}
+
 
 
 
