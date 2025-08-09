@@ -191,3 +191,29 @@ app.post('/merge', async (req, res) => {
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.get('/', (_req, res) => res.send('OK'));
 app.listen(port, () => console.log(`Server running on ${port}`));
+
+function sanitizeDropboxUrl(u) {
+  try {
+    const url = new URL(u);
+    if (/dropbox\.com/i.test(url.hostname)) {
+      url.searchParams.delete('st');         // ← drop session-ish param
+      url.searchParams.set('dl', '1');       // ← force direct download
+    }
+    return url.toString();
+  } catch {
+    return u;
+  }
+}
+
+async function downloadDropboxSmart(sharedLink, extFallback) {
+  const clean = sanitizeDropboxUrl(sharedLink);
+  // Try official API first
+  try {
+    return await downloadSharedLinkToTemp(clean, extFallback);
+  } catch (e) {
+    // Fallback to plain HTTP
+    const httpUrl = clean.replace('www.dropbox.com', 'dl.dropboxusercontent.com');
+    return await downloadToTemp(httpUrl, extFallback);
+  }
+}
+
