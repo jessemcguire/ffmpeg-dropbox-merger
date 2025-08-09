@@ -78,6 +78,29 @@ function mergeAV({ videoPath, audioPath, outPath, forceReencode = false }) {
 
 async function safeUnlink(p) { try { await fs.promises.unlink(p); } catch {} }
 
+function sanitizeDropboxUrl(u) {
+  try {
+    const url = new URL(u);
+    if (/dropbox\.com/i.test(url.hostname)) {
+      url.searchParams.delete('st');         // Drop session-ish param
+      url.searchParams.set('dl', '1');       // Force direct download
+    }
+    return url.toString();
+  } catch {
+    return u;
+  }
+}
+
+async function downloadDropboxSmart(sharedLink, extFallback) {
+  const clean = sanitizeDropboxUrl(sharedLink);
+  try {
+    return await downloadSharedLinkToTemp(clean, extFallback);
+  } catch (e) {
+    const httpUrl = clean.replace('www.dropbox.com', 'dl.dropboxusercontent.com');
+    return await downloadToTemp(httpUrl, extFallback);
+  }
+}
+
 // --- Route ---
 app.post('/merge', async (req, res) => {
   const {
@@ -103,12 +126,12 @@ app.post('/merge', async (req, res) => {
   try {
     // Prefer Dropbox API for Dropbox links (avoids 403s)
     videoPath = isDropboxLink(videoUrl)
-      ? await downloadSharedLinkToTemp(videoUrl, '.mp4')
-      : await downloadToTemp(videoUrl, '.mp4');
+  ? await downloadDropboxSmart(videoUrl, '.mp4')
+  : await downloadToTemp(videoUrl, '.mp4');
 
-    audioPath = isDropboxLink(audioUrl)
-      ? await downloadSharedLinkToTemp(audioUrl, '.m4a')
-      : await downloadToTemp(audioUrl, '.m4a');
+audioPath = isDropboxLink(audioUrl)
+  ? await downloadDropboxSmart(audioUrl, '.m4a')
+  : await downloadToTemp(audioUrl, '.m4a');
 
     outPath = path.join('/tmp', `${randomUUID()}.mp4`);
 
@@ -205,15 +228,5 @@ function sanitizeDropboxUrl(u) {
   }
 }
 
-async function downloadDropboxSmart(sharedLink, extFallback) {
-  const clean = sanitizeDropboxUrl(sharedLink);
-  // Try official API first
-  try {
-    return await downloadSharedLinkToTemp(clean, extFallback);
-  } catch (e) {
-    // Fallback to plain HTTP
-    const httpUrl = clean.replace('www.dropbox.com', 'dl.dropboxusercontent.com');
-    return await downloadToTemp(httpUrl, extFallback);
-  }
-}
+
 
