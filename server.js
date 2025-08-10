@@ -21,7 +21,7 @@ app.use(express.json({ limit: "2mb" }));
 app.use(morgan("tiny"));
 
 const PORT = process.env.PORT || 3000;
-const TEMP_DIR = "/tmp"; // Render's writable temp dir
+const TEMP_DIR = "/tmp";
 
 // Dropbox OAuth (refresh-token) env vars
 const DBX_REFRESH = process.env.DROPBOX_REFRESH_TOKEN;
@@ -29,11 +29,10 @@ const DBX_APP_KEY = process.env.DROPBOX_APP_KEY;
 const DBX_APP_SECRET = process.env.DROPBOX_APP_SECRET;
 
 if (!DBX_REFRESH || !DBX_APP_KEY || !DBX_APP_SECRET) {
-  console.warn(
-    "Missing Dropbox OAuth env vars. Set DROPBOX_REFRESH_TOKEN, DROPBOX_APP_KEY, DROPBOX_APP_SECRET."
-  );
+  console.warn("Missing Dropbox env vars. Set DROPBOX_REFRESH_TOKEN, DROPBOX_APP_KEY, DROPBOX_APP_SECRET.");
 }
 
+/* -------------------- Logging helper -------------------- */
 function log(step, extra = {}) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), step, ...extra }));
 }
@@ -47,27 +46,34 @@ async function getAccessToken() {
     return tokenCache.accessToken; // reuse until 60s before expiry
   }
 
-  // Exchange refresh token for a new access token
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: DBX_REFRESH,
   });
 
-  const { data } = await axios.post(
-    "https://api.dropboxapi.com/oauth2/token",
-    body.toString(),
-    {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      auth: { username: DBX_APP_KEY, password: DBX_APP_SECRET },
-      timeout: 15000,
-    }
-  );
+  try {
+    const { data } = await axios.post(
+      "https://api.dropboxapi.com/oauth2/token",
+      body.toString(),
+      {
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        auth: { username: DBX_APP_KEY, password: DBX_APP_SECRET },
+        timeout: 15000,
+      }
+    );
 
-  tokenCache.accessToken = data.access_token;
-  // expires_in is seconds
-  tokenCache.expiresAt = Date.now() + (data.expires_in || 14400) * 1000;
-  log("dropbox.token.refreshed", { expires_in: data.expires_in });
-  return tokenCache.accessToken;
+    tokenCache.accessToken = data.access_token;
+    tokenCache.expiresAt = Date.now() + (data.expires_in || 14400) * 1000; // seconds → ms
+    log("dropbox.token.refreshed", { expires_in: data.expires_in });
+    return tokenCache.accessToken;
+  } catch (err) {
+    console.error("dropbox.token.error", {
+      status: err.response?.status,
+      data: err.response?.data,
+      message: err.message,
+    });
+    throw err;
+  }
 }
 
 async function getDropboxClient() {
@@ -75,7 +81,7 @@ async function getDropboxClient() {
   return new Dropbox({ accessToken, fetch: fetch });
 }
 
-/* -------------------- Helpers -------------------- */
+/* -------------------- File helpers -------------------- */
 function inferExt(url, fallback = ".bin") {
   try {
     const ext = path.extname(new URL(url).pathname);
@@ -145,7 +151,7 @@ function mergeAV(videoPath, audioPath) {
       .outputOptions([
         "-map 0:v:0",
         "-map 1:a:0",
-        "-c:v copy", // fast path; if problems, swap to: "-c:v libx264", "-preset veryfast"
+        "-c:v copy", // fast path; if issues, swap to '-c:v libx264' and add '-preset veryfast'
         "-c:a aac",
         "-b:a 192k",
         "-shortest",
@@ -175,10 +181,8 @@ async function uploadToDropbox(localPath, dropboxPath) {
 }
 
 /* -------------------- Routes -------------------- */
-// Health check
 app.get("/", (_req, res) => res.send("OK"));
 
-// POST /merge { videoUrl, audioUrl, dropboxPath? }
 app.post("/merge", async (req, res) => {
   const { videoUrl, audioUrl, dropboxPath } = req.body || {};
   if (!videoUrl || !audioUrl) {
