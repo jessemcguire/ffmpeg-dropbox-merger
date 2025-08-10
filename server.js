@@ -183,8 +183,14 @@ async function uploadToDropbox(localPath, dropboxPath) {
 /* -------------------- Routes -------------------- */
 app.get("/", (_req, res) => res.send("OK"));
 
+/**
+ * POST /merge
+ * Body: { videoUrl, audioUrl, dropboxPath?, noStream? }
+ * If noStream=true, we upload to Dropbox (if dropboxPath provided) and return JSON immediately.
+ * Otherwise we stream the merged MP4 back in the response.
+ */
 app.post("/merge", async (req, res) => {
-  const { videoUrl, audioUrl, dropboxPath } = req.body || {};
+  const { videoUrl, audioUrl, dropboxPath, noStream } = req.body || {};
   if (!videoUrl || !audioUrl) {
     return res.status(400).json({ error: "videoUrl and audioUrl are required" });
   }
@@ -202,16 +208,28 @@ app.post("/merge", async (req, res) => {
     mPath = await mergeAV(vPath, aPath);
     log("ffmpeg.merge.done", { mPath });
 
+    let savedPath = null;
     if (dropboxPath) {
-      const finalPath = dropboxPath.endsWith(".mp4")
+      savedPath = dropboxPath.endsWith(".mp4")
         ? dropboxPath
         : `${dropboxPath}/merged-${Date.now()}.mp4`;
-      log("dropbox.upload.start", { finalPath });
-      const up = await uploadToDropbox(mPath, finalPath);
+      log("dropbox.upload.start", { savedPath });
+      const up = await uploadToDropbox(mPath, savedPath);
       log("dropbox.upload.done", { id: up?.result?.id || up?.id });
-      res.setHeader("X-Dropbox-Path", finalPath);
+      res.setHeader("X-Dropbox-Path", savedPath);
     }
 
+    if (noStream) {
+      // Fast JSON response for automations (e.g., Make)
+      await Promise.allSettled([
+        vPath && fs.promises.unlink(vPath).catch(() => {}),
+        aPath && fs.promises.unlink(aPath).catch(() => {}),
+        mPath && fs.promises.unlink(mPath).catch(() => {})
+      ]);
+      return res.status(200).json({ ok: true, dropboxPath: savedPath });
+    }
+
+    // Default: stream the MP4 back
     res.setHeader("Content-Type", "video/mp4");
     res.setHeader("Content-Disposition", `inline; filename="merged.mp4"`);
     const stream = fs.createReadStream(mPath);
