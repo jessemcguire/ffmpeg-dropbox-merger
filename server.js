@@ -29,26 +29,57 @@ function log(step, extra = {}) {
 }
 
 // Try to infer an extension from URL; fall back if missing
+// --- helpers: inferExt & temp path (keep yours if already present) ---
 function inferExt(url, fallback = ".bin") {
-  try {
-    const p = new URL(url).pathname;
-    const ext = path.extname(p);
-    if (ext) return ext;
-  } catch {}
+  try { const ext = path.extname(new URL(url).pathname); if (ext) return ext; } catch {}
   return fallback;
 }
+function tmpPath(ext = ".bin") { return path.join("/tmp", `${Date.now()}-${randomUUID()}${ext}`); }
 
-function tmpPath(ext = ".bin") {
-  return path.join(TEMP_DIR, `${Date.now()}-${randomUUID()}${ext}`);
+// --- NEW: download via Dropbox API when input is a Dropbox link or a Dropbox path ---
+async function downloadViaDropbox(input, fallbackExt = ".bin") {
+  if (!DROPBOX_TOKEN) throw new Error("Missing DROPBOX_ACCESS_TOKEN");
+  const dbx = new Dropbox({ accessToken: DROPBOX_TOKEN, fetch: fetch });
+
+  // 1) If it's a shared link (https://www.dropbox.com/...), use sharingGetSharedLinkFile
+  if (/^https?:\/\/.*dropbox\.com/i.test(input)) {
+    const { result } = await dbx.sharingGetSharedLinkFile({ url: input });
+    const name = (result?.name) || "file" + fallbackExt;
+    const ext = path.extname(name) || inferExt(input, fallbackExt);
+    const out = tmpPath(ext);
+    const buf = Buffer.from(result.fileBinary); // ArrayBuffer -> Buffer
+    await fs.promises.writeFile(out, buf);
+    return out;
+  }
+
+  // 2) If it looks like a Dropbox path (/Folder/file.mp4), get a temporary link then stream it
+  if (input.startsWith("/")) {
+    const { result } = await dbx.filesGetTemporaryLink({ path: input });
+    const direct = result.link;                       // real, expiring URL to the bytes
+    const name = result.metadata?.name || "file" + fallbackExt;
+    const ext = path.extname(name) || fallbackExt;
+    const out = tmpPath(ext);
+    const resp = await axios.get(direct, { responseType: "stream", maxRedirects: 5 });
+    await pipeline(resp.data, fs.createWriteStream(out));
+    return out;
+  }
+
+  throw new Error("Unsupported Dropbox input. Provide a shared link (https://www.dropbox.com/...) or a Dropbox path like /Folder/file.mp4");
 }
 
-async function downloadToFile(url, fallbackExt = ".bin") {
-  const ext = inferExt(url, fallbackExt);
-  const outPath = tmpPath(ext);
-  const resp = await axios.get(url, { responseType: "stream", maxRedirects: 5 });
-  await pipeline(resp.data, fs.createWriteStream(outPath));
-  return outPath;
+// --- replace your existing downloadToFile with this wrapper ---
+async function downloadToFile(urlOrPath, fallbackExt = ".bin") {
+  // Use Dropbox API for any Dropbox input; otherwise fall back to normal HTTP
+  if (/^https?:\/\/.*dropbox\.com/i.test(urlOrPath) || urlOrPath.startsWith("/")) {
+    return downloadViaDropbox(urlOrPath, fallbackExt);
+  }
+  const ext = inferExt(urlOrPath, fallbackExt);
+  const out = tmpPath(ext);
+  const resp = await axios.get(urlOrPath, { responseType: "stream", maxRedirects: 5, headers: { "User-Agent": "curl/8" } });
+  await pipeline(resp.data, fs.createWriteStream(out));
+  return out;
 }
+
 
 function mergeAV(videoPath, audioPath) {
   return new Promise((resolve, reject) => {
