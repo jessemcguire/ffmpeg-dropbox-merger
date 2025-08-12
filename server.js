@@ -23,6 +23,14 @@ app.use(morgan("tiny"));
 const PORT = process.env.PORT || 3000;
 const TEMP_DIR = "/tmp";
 
+/* -------------------- Security (shared secret) -------------------- */
+const APP_SECRET = process.env.APP_SECRET || null;
+function requireSecret(req, res, next) {
+  if (!APP_SECRET) return next(); // allow if not configured
+  if (req.get("X-App-Secret") === APP_SECRET) return next();
+  return res.status(401).json({ error: "Unauthorized" });
+}
+
 /* -------------------- Dropbox (refresh -> access) -------------------- */
 const DBX_REFRESH = process.env.DROPBOX_REFRESH_TOKEN;
 const DBX_APP_KEY = process.env.DROPBOX_APP_KEY;
@@ -71,17 +79,9 @@ async function getDropboxClient() {
 const TT_APP_KEY = process.env.TIKTOK_APP_KEY;
 const TT_APP_SECRET = process.env.TIKTOK_APP_SECRET;
 const TT_REFRESH = process.env.TIKTOK_REFRESH_TOKEN;
-const APP_SECRET = process.env.APP_SECRET;
 
 if ((TT_APP_KEY || TT_APP_SECRET || TT_REFRESH) && (!TT_APP_KEY || !TT_APP_SECRET || !TT_REFRESH)) {
   console.warn("TikTok envs partially set. Need TIKTOK_APP_KEY, TIKTOK_APP_SECRET, TIKTOK_REFRESH_TOKEN.");
-}
-
-// Shared-secret middleware (optional but recommended)
-function requireSecret(req, res, next) {
-  if (!APP_SECRET) return next();
-  if (req.get("X-App-Secret") === APP_SECRET) return next();
-  return res.status(401).json({ error: "Unauthorized" });
 }
 
 async function getTtAccessToken() {
@@ -177,7 +177,7 @@ function mergeAV(videoPath, audioPath) {
       .outputOptions([
         "-map 0:v:0",
         "-map 1:a:0",
-        "-c:v copy",     // if container issues, change to: "-c:v libx264", "-preset veryfast"
+        "-c:v copy",     // change to libx264 if container/codec mismatch
         "-c:a aac",
         "-b:a 192k",
         "-shortest"
@@ -202,22 +202,12 @@ async function uploadToDropbox(localPath, dropboxPath) {
 /* -------------------- Routes -------------------- */
 app.get("/", (_req, res) => res.send("OK"));
 
-// Warm up both token providers to avoid cold-start latency
+// Single, secured wake route (pre-warms tokens)
 app.get("/wake", requireSecret, async (_req, res) => {
   try {
     const tasks = [getAccessToken()];
     if (TT_APP_KEY && TT_APP_SECRET && TT_REFRESH) tasks.push(getTtAccessToken());
     await Promise.allSettled(tasks);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// put near your other routes
-app.get("/wake", async (_req, res) => {
-  try {
-    await getAccessToken(); // refresh Dropbox token now
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -283,6 +273,8 @@ app.post("/merge", requireSecret, async (req, res) => {
   }
 });
 
+/* ---- TikTok endpoints (optional) ---- */
+
 // In-memory idempotency for /tiktok/post
 const idem = new Map(); // key -> { publish_id, at }
 setInterval(() => {
@@ -290,12 +282,11 @@ setInterval(() => {
   for (const [k, v] of idem) if (now - v.at > 6 * 60 * 60 * 1000) idem.delete(k);
 }, 30 * 60 * 1000);
 
-// Post merged file to TikTok (optional)
+// Post merged file to TikTok
 app.post("/tiktok/post", requireSecret, async (req, res) => {
   const { dropboxPath, caption, privacy = "SELF_ONLY" } = req.body || {};
   const idemKey = req.get("Idempotency-Key");
   if (!dropboxPath || !caption) return res.status(400).json({ error: "dropboxPath and caption are required" });
-
   if (!TT_APP_KEY || !TT_APP_SECRET || !TT_REFRESH) {
     return res.status(400).json({ error: "TikTok env not configured" });
   }
@@ -329,7 +320,7 @@ app.post("/tiktok/post", requireSecret, async (req, res) => {
   }
 });
 
-// Check post status (optional)
+// Check post status
 app.get("/tiktok/status", requireSecret, async (req, res) => {
   const publish_id = req.query.publish_id;
   if (!publish_id) return res.status(400).json({ error: "publish_id required" });
